@@ -1,6 +1,7 @@
 
 import json
 from enum import IntEnum
+import os
 import SimpleITK as sitk
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,8 +13,40 @@ from scipy.spatial import distance
 from scipy.ndimage import center_of_mass, binary_dilation, distance_transform_edt
 import cv2
 from scipy.spatial import cKDTree
+from skimage import measure
+import trimesh
+from tqdm import tqdm
 # set a non-interactive backend for matplotlib
-plt.switch_backend('Agg')
+# plt.switch_backend('Agg')
+from mpl_toolkits.mplot3d import Axes3D
+
+class BaseLabel(IntEnum):
+    BODY_OUTLINE = 0
+    LEFT_LUNG = 1
+    RIGHT_LUNG = 2
+    LV_BP  = 3
+    LV_MYO = 4
+    RV_BP  = 5
+    RV_MYO = 6
+    LA     = 7
+    RA     = 8
+    AAo    = 9
+    PA_MAIN     = 10
+    DAo    = 11
+    PA_TREE   = 12
+    PV_TREE   = 13
+    CLOT    = 14
+    CENTRAL_CLOT = 15
+    NORMAL_LUNG = 16
+    ARTEFACT = 17
+    PGG_LUNG = 18
+    GGR_LUNG = 19
+    HONEYCOMB_LUNG = 20
+    CONSOLIDATION_LUNG = 21
+    EMPHYSEMA_LUNG = 22
+    AIR_TRAPPING_LUNG = 23
+    MOSIAC_PERFUSION_LUNG = 24
+
 
 class CardiacLabel(IntEnum):
     LV_BP  = 1
@@ -26,9 +59,12 @@ class CardiacLabel(IntEnum):
     PA     = 8
     DAo    = 9
 
+
 class SADiameterTool():
 
     def __init__(self, image_path, label_path, output_path=None ):
+        self.debug = True
+        self.debug_dir = "data"
         self.image_path = image_path
         self.label_path = label_path
         self.output_path = output_path
@@ -58,6 +94,7 @@ class SADiameterTool():
 
     def process(self):
 
+        # self.pa_pv_vessel_analysis()
         self.read_image_and_label()
         self.get_np_cardiac_masks()
         self.calculate_lv_mid_point()
@@ -73,11 +110,151 @@ class SADiameterTool():
 
         self.thickness_analysis()
 
+    def thickness_dev(self):
+        lv_mask_np = (self.lbl_sa_np == CardiacLabel.LV_MYO)# this contains both epicardial and endocardial surfaces
+        spacing = self.img_sa.GetSpacing()[::-1]  # z,y,x order
+        origin = np.array(self.img_sa.GetOrigin())[::-1]  # z,y,x order
+
+        verts, faces, _, _ = measure.marching_cubes(
+            lv_mask_np.astype(np.uint8),
+            level=0.5,
+            spacing=spacing
+        )
+        mesh = trimesh.Trimesh(verts + origin, faces, process=False)
+        mesh.fix_normals()
+        lv_center = mesh.vertices.mean(axis=0)
+
+        face_centers = mesh.triangles_center
+        face_normals = mesh.face_normals
+
+        to_center = lv_center - face_centers  # (M, 3)
+        dot_prods = np.einsum('ij,ij->i', to_center, face_normals)
+
+        epi_faces  = np.where(dot_prods < 0)[0]
+        endo_faces = np.where(dot_prods > 0)[0]
+
+        epi_mesh  = mesh.submesh([epi_faces], append=True)
+        endo_mesh = mesh.submesh([endo_faces], append=True)
+
+        #========= Reduce mesh complexity ==============
+        target_frac = 0.9  # keep 10% of faces
+        endo_mesh_s = endo_mesh.simplify_quadric_decimation(
+            percent=target_frac,
+            aggression=8
+        )
+        epi_mesh_s = epi_mesh.simplify_quadric_decimation(
+            percent=target_frac,
+            aggression=8
+        )
+        
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        # Endocardium (blue)
+        ax.plot_trisurf(
+            endo_mesh_s.vertices[:, 0],
+            endo_mesh_s.vertices[:, 1],
+            endo_mesh_s.vertices[:, 2],
+            triangles=endo_mesh_s.faces,
+            color='blue',
+            alpha=0.3,
+            linewidth=0.1,
+            edgecolor='none'
+        )
+
+        # Epicardium (red)
+        ax.plot_trisurf(
+            epi_mesh_s.vertices[:, 0],
+            epi_mesh_s.vertices[:, 1],
+            epi_mesh_s.vertices[:, 2],
+            triangles=epi_mesh_s.faces,
+            color='red',
+            alpha=0.3,
+            linewidth=0.1,
+            edgecolor='none'
+        )
+
+        ax.set_title("Endo (blue) and Epi (red) surfaces")
+        ax.set_box_aspect([1, 1, 1])
+        plt.show()
+        #========= RAY CASTING METHOD ==============
+        origins = endo_mesh_s.vertices
+        normals = endo_mesh_s.vertex_normals
+        eps = 0.5  # mm, try 0.3–1.0
+        origins_fwd = origins + eps * normals
+        origins_bwd = origins - eps * normals
+        # forward rays
+        loc_fwd, idx_ray_fwd, idx_tri_fwd = epi_mesh_s.ray.intersects_location(
+            ray_origins=origins_fwd,
+            ray_directions=normals,
+            multiple_hits=False
+        )
+
+        # backward rays
+        loc_bwd, idx_ray_bwd, idx_tri_bwd = epi_mesh_s.ray.intersects_location(
+            ray_origins=origins_bwd,
+            ray_directions=-normals,
+            multiple_hits=False
+        )
+
+        # calculate distances
+        dist_fwd = np.linalg.norm(
+            loc_fwd - origins[idx_ray_fwd], axis=1
+        )
+
+        dist_bwd = np.linalg.norm(
+            loc_bwd - origins[idx_ray_bwd], axis=1
+        )
+
+        cos_fwd = np.abs(
+            np.einsum(
+                'ij,ij->i',
+                normals[idx_ray_fwd],
+                epi_mesh_s.face_normals[idx_tri_fwd]
+            )
+        )
+
+        cos_bwd = np.abs(
+            np.einsum(
+                'ij,ij->i',
+                normals[idx_ray_bwd],
+                epi_mesh_s.face_normals[idx_tri_bwd]
+            )
+        )
+        
+        thickness = np.full(len(origins), np.nan)
+
+        # forward
+        for r, d, c in zip(idx_ray_fwd, dist_fwd, cos_fwd):
+            if c > 0.3:  # optional angle gate
+                thickness[r] = d
+
+        # backward
+        for r, d, c in zip(idx_ray_bwd, dist_bwd, cos_bwd):
+            if c > 0.3:
+                if np.isnan(thickness[r]) or d < thickness[r]:
+                    thickness[r] = d
+
+        thickness[(thickness < 0) | (thickness > 30)] = np.nan # filter outliers
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        sc = ax.scatter(
+            origins[:, 0],
+            origins[:, 1],
+            origins[:, 2],
+            c=thickness,
+            cmap='viridis',
+            s=4
+        )
+
+        ...
+
     def thickness_analysis(self):
+        self.thickness_dev()
 
         self.select_aha_slices()
         self.calculate_aha_slices()
-        thickness_results = self.structure_thickness_analysis(endocardial_mask=self.lv_endo_mask_sa, epicardial_mask=self.lv_epi_mask_sa, image=self.img_sa)
+        thickness_results = self.structure_thickness_analysis(endocardial_mask=self.lv_endo_mask_sa, epicardial_mask=self.lv_epi_mask_sa, image=self.img_sa)        
 
         mean_thickness = []
         p10_thickness = []
@@ -121,7 +298,6 @@ class SADiameterTool():
             aha_output_path = self.output_path.replace('.png', '_aha.png')
             self.aha_fig.savefig(aha_output_path, dpi=300)
             plt.close(self.aha_fig)
-
 
 
     def export_figure(self):
@@ -231,12 +407,12 @@ class SADiameterTool():
         remapped_lbl_img = sitk.GetImageFromArray(remapped_lbl)
         remapped_lbl_img.CopyInformation(lbl)
 
-        self.img = img
-        self.lbl = remapped_lbl_img
+        self.img_itk = img
+        self.lbl_itk = remapped_lbl_img
 
 
     def get_np_cardiac_masks(self):
-        self.lbl_np = sitk.GetArrayFromImage(self.lbl)  # Z,Y,X
+        self.lbl_np = sitk.GetArrayFromImage(self.lbl_itk)  # Z,Y,X
 
         self.lv_mask_oo = (self.lbl_np == CardiacLabel.LV_MYO) | (self.lbl_np == CardiacLabel.LV_BP)
         self.rv_mask_oo = (self.lbl_np == CardiacLabel.RV_MYO) | (self.lbl_np == CardiacLabel.RV_BP)
@@ -246,10 +422,10 @@ class SADiameterTool():
 
     def calculate_lv_mid_point(self):
         lv_cog_vox = np.mean(np.column_stack(np.where(self.lv_mask_oo)),axis=0)  # Z,Y,X
-        self.lv_cog_mm_world = self.img.TransformIndexToPhysicalPoint((int(lv_cog_vox[2]), int(lv_cog_vox[1]), int(lv_cog_vox[0])))
+        self.lv_cog_mm_world = self.img_itk.TransformIndexToPhysicalPoint((int(lv_cog_vox[2]), int(lv_cog_vox[1]), int(lv_cog_vox[0])))
 
         # let's display the LV COG in the current image space
-        img_np = sitk.GetArrayFromImage(self.img)
+        img_np = sitk.GetArrayFromImage(self.img_itk)
         self.ax[0,0].imshow(img_np[ int(lv_cog_vox[0]) ], cmap="gray", vmin=self.cm_ll, vmax=self.cm_ul)
         self.ax[0,0].scatter([lv_cog_vox[2]], [lv_cog_vox[1]], c="b", s=1)
         self.ax[0,0].set_title("LV COG\n (original image space)", fontsize=self.fontsize+1)
@@ -258,9 +434,9 @@ class SADiameterTool():
 
     def calculate_pca_major_axis(self):
         # get our mask coordinates in physical space
-        lv_pts = self.mask_to_physical_points(self.lv_mask_oo, self.img)
-        rv_pts = self.mask_to_physical_points(self.rv_mask_oo, self.img)
-        la_pts = self.mask_to_physical_points(self.la_mask_oo, self.img)
+        lv_pts = self.mask_to_physical_points(self.lv_mask_oo, self.img_itk)
+        rv_pts = self.mask_to_physical_points(self.rv_mask_oo, self.img_itk)
+        la_pts = self.mask_to_physical_points(self.la_mask_oo, self.img_itk)
 
         # PCA on LV points to get long axis direction
         pca = PCA(n_components=3)
@@ -322,14 +498,14 @@ class SADiameterTool():
         ])
 
         corners_phys = np.array([
-            self.img.TransformIndexToPhysicalPoint((int(c[0]), int(c[1]), int(c[2])))
+            self.img_itk.TransformIndexToPhysicalPoint((int(c[0]), int(c[1]), int(c[2])))
             for c in cardiac_corners
         ])
 
         corners_cardiac = (self.A_world_to_cardiac[:3,:3] @ corners_phys.T).T + self.A_world_to_cardiac[:3,3]
         min_c = corners_cardiac.min(axis=0)
         max_c = corners_cardiac.max(axis=0)
-        out_spacing = self.img.GetSpacing()
+        out_spacing = self.img_itk.GetSpacing()
         extent = max_c - min_c
         out_size = np.ceil(extent / out_spacing).astype(int)
 
@@ -353,10 +529,10 @@ class SADiameterTool():
         resampler.SetTransform(tx)
         resampler.SetDefaultPixelValue(-1024)
 
-        self.img_sa = resampler.Execute(self.img)
+        self.img_sa = resampler.Execute(self.img_itk)
         resampler.SetInterpolator(sitk.sitkNearestNeighbor)
         resampler.SetDefaultPixelValue(0)
-        self.lbl_sa = resampler.Execute(self.lbl)
+        self.lbl_sa = resampler.Execute(self.lbl_itk)
 
 
     def select_aha_slices(self):
@@ -405,7 +581,7 @@ class SADiameterTool():
         (Z, Y, X) = self.img_sa.TransformPhysicalPointToIndex(centre_point_mm)  # in SA image space, Z,Y,X
 
 
-
+        # Create AHA masks for each slice
         aha_mask = np.zeros_like(self.lbl_sa_np, dtype=np.uint8)
         for z in self.basal_slices:
             lv_bp_mask = self.lv_endo_mask_sa[z]
@@ -678,6 +854,43 @@ class SADiameterTool():
     def structure_thickness_analysis(self, endocardial_mask, epicardial_mask, image):
         """ Calculates myocardial wall thicknesses in the SA image space"""
 
+        spacing_np = np.array(image.GetSpacing())[::-1]  # z,y,x order
+        origin_np = np.array(image.GetOrigin())[::-1]  # z,y,x order
+
+
+        verts_endo, faces_endo, normals_endo, values_endo = measure.marching_cubes(
+            volume=endocardial_mask.astype(np.uint8),
+            level=0.5,
+            spacing=spacing_np  # IMPORTANT: gives mm coordinates, needs to be in numpy array order (z,y,x)
+        )
+
+        verts_epi, faces_epi, normals_epi, values_epi = measure.marching_cubes(
+            volume=epicardial_mask.astype(np.uint8),
+            level=0.5,
+            spacing=spacing_np  # IMPORTANT: gives mm coordinates, needs to be in numpy array order (z,y,x)
+        )
+
+        endo_mesh = trimesh.Trimesh(vertices=verts_endo, faces=faces_endo, vertex_normals=normals_endo, process=False)
+        epi_mesh = trimesh.Trimesh(vertices=verts_epi, faces=faces_epi, vertex_normals=normals_epi, process=False)
+
+        endo_mesh.fix_normals()
+        epi_mesh.fix_normals()
+        #========= RAY CASTING METHOD ==============
+
+        origins = endo_mesh.vertices  # in mm
+        directions = endo_mesh.vertex_normals  # in mm
+
+        locations, index_ray, index_tri = epi_mesh.ray.intersects_location(
+            ray_origins=origins,
+            ray_directions=directions,
+            multiple_hits=False
+        )
+        thickness = np.full(len(origins), np.nan)
+        thickness[index_ray] = np.linalg.norm(
+            locations - origins[index_ray], axis=1
+        )
+
+
         dist_endo = distance_transform_edt(endocardial_mask==0)
         dist_epi = distance_transform_edt(epicardial_mask==0)
 
@@ -711,25 +924,33 @@ class SADiameterTool():
         # we can also get the AHA segment for each point
         aha_segs = self.aha_lv_myo[endo_pts_vox[:,0], endo_pts_vox[:,1], endo_pts_vox[:,2]]
 
-        # for each AHA segment, get mean thickness, 10th percentile, 90th percentile, stddev
+        # for each AHA segment, get mean thickness, 10th percentile, 90th percentile, stddev,
+        # we should also get the greylevel values in the original image for each segment
+        image_np = sitk.GetArrayFromImage(image)
         thickness_stats = {}
         for seg in range(1, 18):
             seg_thickness = thickness_mm[aha_segs == seg]
+            seg_greylevels = image_np[self.aha_lv_myo == seg]
             if len(seg_thickness) == 0:
                 continue
             thickness_stats[seg] = {
                 "mean_thickness_mm": np.mean(seg_thickness),
                 "p10_thickness_mm": np.percentile(seg_thickness, 10),
                 "p90_thickness_mm": np.percentile(seg_thickness, 90),
-                "stddev_thickness_mm": np.std(seg_thickness)
+                "stddev_thickness_mm": np.std(seg_thickness),
+                "mean_greylevel": np.mean(seg_greylevels).astype(np.float64),
+                "p_greylevels" : np.percentile(seg_greylevels, np.arange(0,105,5)).astype(np.float64).tolist(),
             }
         # add the overall stats
         overall_thickness = thickness_mm
+        overall_greylevels = image_np[self.aha_lv_myo > 0]
         thickness_stats["overall"] = {
             "mean_thickness_mm": np.mean(overall_thickness),
             "p10_thickness_mm": np.percentile(overall_thickness, 10),
             "p90_thickness_mm": np.percentile(overall_thickness, 90),
-            "stddev_thickness_mm": np.std(overall_thickness)
+            "stddev_thickness_mm": np.std(overall_thickness),
+            "mean_greylevel": np.mean(overall_greylevels).astype(np.float64),
+            "p_greylevels" : np.percentile(overall_greylevels, np.arange(0,105,5)).astype(np.float64).tolist(),
         }
         return thickness_stats
     
@@ -1355,6 +1576,323 @@ class SADiameterTool():
 
         return mask
     
+
+    @staticmethod
+    def remap_bitmask_labels(label_array, label_mapping):
+        """
+        Remap bitmask labels to a compact range starting from 1.
+
+        Parameters
+        ----------
+        label_array : ndarray
+            The input label array with bitmask labels.
+        label_mapping : dict
+            A dictionary mapping new labels to old bitmask labels.
+
+        Returns
+        -------
+        remapped_lbl : ndarray
+            The remapped label array.
+        """
+        remapped_lbl = np.zeros_like(label_array, dtype=np.uint8)
+        for new_label, old_label in label_mapping.items():
+            remapped_lbl |= (((label_array >> old_label) & 1) * new_label).astype(np.uint8)
+        return remapped_lbl
+
+    def pa_pv_vessel_analysis(self):
+        """
+        Post processing analysis of the PA and PV trees to extract volumes > and < 5mm diameter.
+
+        Algorithm steps:
+        1. Load the PA and PV segmentation masks.
+        2. Upsample the masks to 0.1mm isotropic resolution using nearest neighbor interpolation. (This may get large and need to be done in chunks).
+        3. Erode the masks by 2.5mm radius sphere to remove vessels < 5mm diameter.
+        4. Expand the eroded masks back by 2.5mm radius sphere to restore original size.
+        5. Calculate the volume of the original masks and the processed masks to get approximate volumes > and < 5mm diameter.
+        """
+        lbl = sitk.ReadImage(self.label_path, sitk.sitkUInt64)
+        lbl_np = sitk.GetArrayFromImage(lbl)
+        voxel_volume = np.prod(lbl.GetSpacing())
+
+        # Remap our bitmask labels to a compact range starting from 1
+        vessels_lbl = self.remap_bitmask_labels(
+            lbl_np,
+            {
+                1: BaseLabel.PA_TREE.value,
+                2: BaseLabel.PV_TREE.value,
+            }
+        )
+        lung_lbl = self.remap_bitmask_labels(
+            lbl_np,
+            {
+                1: BaseLabel.LEFT_LUNG.value,
+                2: BaseLabel.RIGHT_LUNG.value,
+            }
+        )
+
+        # Load PA and PV masks
+        pa_mask_np = vessels_lbl == 1
+        pv_mask_np = vessels_lbl == 2
+        pa_total_vol = np.sum(pa_mask_np) * voxel_volume # get total volume early on before we modify the masks
+        pv_total_vol = np.sum(pv_mask_np) * voxel_volume
+        left_lung_mask = lung_lbl == 1
+        right_lung_mask = lung_lbl == 2
+
+        # Here we need to do something to ensure that the lung region is consistent in the hilar region, a bit like
+        # "wrapping" the structure achieves in mimics. Probably best to do an expand and contract on each lung separately
+
+        left_lung_itk = sitk.GetImageFromArray(left_lung_mask.astype(np.uint8))
+        left_lung_itk.SetSpacing(lbl.GetSpacing())
+        left_lung_itk.SetOrigin(lbl.GetOrigin())
+        left_lung_itk.SetDirection(lbl.GetDirection())
+
+        right_lung_itk = sitk.GetImageFromArray(right_lung_mask.astype(np.uint8))
+        right_lung_itk.SetSpacing(lbl.GetSpacing())
+        right_lung_itk.SetOrigin(lbl.GetOrigin())
+        right_lung_itk.SetDirection(lbl.GetDirection())
+
+        spacing = lbl.GetSpacing()
+        closing_radius_mm = 15.0  # 15mm closing to fill holes at the hilum
+
+        radius_vox_closing = [
+            int(np.ceil(closing_radius_mm / s) )
+            for s in spacing
+        ]
+
+        left_lung_wrapped = sitk.BinaryMorphologicalClosing(
+            left_lung_itk,
+            radius_vox_closing,
+            sitk.sitkBall
+        )
+
+        right_lung_wrapped = sitk.BinaryMorphologicalClosing(
+            right_lung_itk,
+            radius_vox_closing,
+            sitk.sitkBall
+        )
+
+        left_lung_mask = sitk.GetArrayFromImage(left_lung_wrapped).astype(np.bool)
+        right_lung_mask = sitk.GetArrayFromImage(right_lung_wrapped).astype(np.bool)
+
+        lung_mask = left_lung_mask | right_lung_mask
+
+        # subtract medistinal vessels from PA & PV trees
+        pa_mask_np = pa_mask_np & lung_mask
+        pv_mask_np = pv_mask_np & lung_mask
+
+        #=======================================
+        # Calculate an exact distance map
+        spacing_np = np.array(spacing)[::-1]  # z,y,x
+        origin_np = np.array(lbl.GetOrigin())[::-1]
+        verts, faces, normals, values = measure.marching_cubes(
+            volume=pa_mask_np.astype(np.uint8),
+            level=0.5,
+            spacing=spacing_np  # IMPORTANT: gives mm coordinates, needs to be in numpy array order (z,y,x)
+        )
+
+        coords_np = np.argwhere(pa_mask_np>0)
+
+        points_np = (coords_np + 0.5) * spacing_np  # convert to mm space
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+
+        CHUNK = 10000  # tune this
+        distances = []
+
+        for i in tqdm(range(0, len(points_np), CHUNK), desc="Calculating PA distance map"):
+            pts = points_np[i:i+CHUNK]
+            d = mesh.nearest.signed_distance(pts)
+            distances.append(d)
+
+        distances = np.concatenate(distances)
+
+        #=======================================
+
+        pa_itk = sitk.GetImageFromArray(pa_mask_np.astype(np.uint8))
+        pv_itk = sitk.GetImageFromArray(pv_mask_np.astype(np.uint8))
+        pa_itk.SetSpacing(lbl.GetSpacing())
+        pa_itk.SetOrigin(lbl.GetOrigin())
+        pa_itk.SetDirection(lbl.GetDirection())
+        pv_itk.SetSpacing(lbl.GetSpacing())
+        pv_itk.SetOrigin(lbl.GetOrigin())
+        pv_itk.SetDirection(lbl.GetDirection())
+
+        pa_dist = sitk.SignedMaurerDistanceMap(
+            pa_itk,
+            insideIsPositive=True,
+            squaredDistance=False,
+            useImageSpacing=True
+        )
+
+        pv_dist = sitk.SignedMaurerDistanceMap(
+            pv_itk,
+            insideIsPositive=True,
+            squaredDistance=False,
+            useImageSpacing=True
+        )
+
+        mm_squared_threshold = 5
+
+        radius_mm = (mm_squared_threshold / np.pi) ** 0.5 # radius for 5mm^2 area
+
+        pa_core = pa_dist >= radius_mm
+        pv_core = pv_dist >= radius_mm
+
+        radius_vox = [
+            int(np.ceil(radius_mm / s) +1 )
+            for s in spacing
+        ]
+
+        pa_gt5_mask = sitk.BinaryDilate(
+            pa_core,
+            radius_vox,
+            sitk.sitkBall
+        )
+
+        pv_gt5_mask = sitk.BinaryDilate(
+            pv_core,
+            radius_vox,
+            sitk.sitkBall
+        )
+
+        pa_gt5_mask = pa_gt5_mask & pa_itk
+        pv_gt5_mask = pv_gt5_mask & pv_itk
+
+        pa_lt5_mask = pa_itk & (~pa_gt5_mask)
+        pv_lt5_mask = pv_itk & (~pv_gt5_mask)
+
+        pa_dist_array = sitk.GetArrayFromImage(pa_dist)
+        pv_dist_array = sitk.GetArrayFromImage(pv_dist)
+
+        pa_dist_array = pa_dist_array[pa_dist_array >0]
+        pv_dist_array = pv_dist_array[pv_dist_array >0]
+
+        bins = np.logspace(np.log10(0.25), np.log10(10), num=30)
+
+        pa_hist, _ = np.histogram(pa_dist_array, bins=bins, weights=np.full_like(pa_dist_array, voxel_volume))
+        pv_hist, _ = np.histogram(pv_dist_array, bins=bins, weights=np.full_like(pv_dist_array, voxel_volume))
+
+        pa_gt5_vol = np.sum(sitk.GetArrayFromImage(pa_gt5_mask)) * voxel_volume
+        pv_gt5_vol = np.sum(sitk.GetArrayFromImage(pv_gt5_mask)) * voxel_volume
+
+        pa_lt5_vol = pa_total_vol - pa_gt5_vol
+        pv_lt5_vol = pv_total_vol - pv_gt5_vol
+
+        vessel_stats = {
+            "spacing_mm": list(spacing),
+            "pa_volume_total_mm3": float(pa_total_vol), # this includes the main PA volume
+            "pv_volume_total_mm3": float(pv_total_vol), # this includes the LA volume and LAA and pulmonary veins
+            "pa_volume_gt5mm_mm3": float(pa_gt5_vol), # excludes main PA
+            "pv_volume_gt5mm_mm3": float(pv_gt5_vol), # excludes LA and pulmonary veins
+            "pa_volume_lt5mm_mm3": float(pa_lt5_vol),
+            "pv_volume_lt5mm_mm3": float(pv_lt5_vol),
+        }
+
+        print(f"PA and PV vessel analysis: {vessel_stats}")
+
+        if self.debug:
+            # Save masks for debugging
+            sitk.WriteImage(pa_gt5_mask, os.path.join(self.debug_dir, "pa_gt5mm_mask.nii.gz"))
+            sitk.WriteImage(pv_gt5_mask, os.path.join(self.debug_dir, "pv_gt5mm_mask.nii.gz"))
+            sitk.WriteImage(pa_core, os.path.join(self.debug_dir, "pa_core_mask.nii.gz"))
+            sitk.WriteImage(pv_core, os.path.join(self.debug_dir, "pv_core_mask.nii.gz"))
+            sitk.WriteImage(pa_itk, os.path.join(self.debug_dir, "pa_original_mask.nii.gz"))
+            sitk.WriteImage(pv_itk, os.path.join(self.debug_dir, "pv_original_mask.nii.gz"))
+            sitk.WriteImage(pa_lt5_mask, os.path.join(self.debug_dir, "pa_lt5mm_mask.nii.gz"))
+            sitk.WriteImage(pv_lt5_mask, os.path.join(self.debug_dir, "pv_lt5mm_mask.nii.gz"))
+
+
+        # del lbl_np, lbl  # free memory
+
+        # mask = (remapped_lbl == 1) | (remapped_lbl == 2)
+
+        # coords = np.where(mask)
+        # zmin, ymin, xmin = [int(c.min()) for c in coords]
+        # zmax, ymax, xmax = [int(c.max()) for c in coords]
+
+        # spacing = remapped_lbl_img.GetSpacing()  # (sx, sy, sz)
+        # margin_mm = 5.0  # generous but cheap
+
+        # margin_vox = [
+        #     int(np.ceil(margin_mm / spacing[2])),  # z
+        #     int(np.ceil(margin_mm / spacing[1])),  # y
+        #     int(np.ceil(margin_mm / spacing[0])),  # x
+        # ]
+
+        # zmin = max(0, zmin - margin_vox[0])
+        # ymin = max(0, ymin - margin_vox[1])
+        # xmin = max(0, xmin - margin_vox[2])
+
+        # zmax = min(mask.shape[0] - 1, zmax + margin_vox[0])
+        # ymax = min(mask.shape[1] - 1, ymax + margin_vox[1])
+        # xmax = min(mask.shape[2] - 1, xmax + margin_vox[2])
+        
+        # pa_mask_crop = (remapped_lbl[zmin:zmax+1, ymin:ymax+1, xmin:xmax+1] == 1)
+        # pv_mask_crop = (remapped_lbl[zmin:zmax+1, ymin:ymax+1, xmin:xmax+1] == 2)
+
+        # # Upsample to 0.1mm isotropic resolution
+        # target_spacing = (0.1, 0.1, 0.1)  # mm
+        # pa_mask_itk = sitk.GetImageFromArray(pa_mask_crop.astype(np.uint8))
+        # pa_mask_itk.SetSpacing(remapped_lbl_img.GetSpacing())
+
+        # pv_mask_itk = sitk.GetImageFromArray(pv_mask_crop.astype(np.uint8))
+        # pv_mask_itk.SetSpacing(remapped_lbl_img.GetSpacing())
+        # # Compute correct output size
+        # orig_spacing = pa_mask_itk.GetSpacing()
+        # orig_size = pa_mask_itk.GetSize()
+
+        # new_size = [
+        #     int(round(orig_size[i] * (orig_spacing[i] / target_spacing[i])))
+        #     for i in range(3)
+        # ]
+
+        # resample = sitk.ResampleImageFilter()
+        # resample.SetOutputSpacing(target_spacing)
+        # resample.SetInterpolator(sitk.sitkNearestNeighbor)
+        # resample.SetOutputOrigin(pa_mask_itk.GetOrigin())
+        # resample.SetOutputDirection(pa_mask_itk.GetDirection())
+        # resample.SetSize(new_size)
+        # pa_mask_upsampled_itk = resample.Execute(pa_mask_itk)
+        # pv_mask_upsampled_itk = resample.Execute(pv_mask_itk)
+
+        # # Erode by 2.5mm radius sphere
+        # erode = sitk.BinaryErodeImageFilter()
+        # erode.SetKernelType(sitk.sitkBall)
+        # erode.SetKernelRadius(int(2.5 / target_spacing[0]))  # radius in pixels
+
+        # pa_mask_eroded_itk = erode.Execute(pa_mask_upsampled_itk)
+        # pv_mask_eroded_itk = erode.Execute(pv_mask_upsampled_itk)
+
+        # # Dilate back by 2.5mm radius sphere
+        # dilate = sitk.BinaryDilateImageFilter()
+        # dilate.SetKernelType(sitk.sitkBall)
+        # dilate.SetKernelRadius(int(2.5 / target_spacing[0]))  # radius in pixels
+        # pa_mask_processed_itk = dilate.Execute(pa_mask_eroded_itk)
+        # pv_mask_processed_itk = dilate.Execute(pv_mask_eroded_itk)
+
+        # # Calculate volumes
+        # pa_mask_np = sitk.GetArrayFromImage(pa_mask_upsampled_itk).astype(bool)
+        # pv_mask_np = sitk.GetArrayFromImage(pv_mask_upsampled_itk).astype(bool)
+        # pa_mask_processed_np = sitk.GetArrayFromImage(pa_mask_processed_itk).astype(bool)
+        # pv_mask_processed_np = sitk.GetArrayFromImage(pv_mask_processed_itk).astype(bool)
+        # voxel_volume_mm3 = np.prod(target_spacing)  # mm^3
+
+        # pa_volume_total_mm3 = np.sum(pa_mask_np) * voxel_volume_mm3
+        # pv_volume_total_mm3 = np.sum(pv_mask_np) * voxel_volume_mm3
+        # pa_volume_gt5mm_mm3 = np.sum(pa_mask_processed_np) * voxel_volume_mm3
+        # pv_volume_gt5mm_mm3 = np.sum(pv_mask_processed_np) * voxel_volume_mm3
+        # pa_volume_lt5mm_mm3 = pa_volume_total_mm3 - pa_volume_gt5mm_mm3
+        # pv_volume_lt5mm_mm3 = pv_volume_total_mm3 - pv_volume_gt5mm_mm3
+
+        # vessel_stats = {
+        #     "pa_volume_total_mm3": float(pa_volume_total_mm3),
+        #     "pv_volume_total_mm3": float(pv_volume_total_mm3),
+        #     "pa_volume_gt5mm_mm3": float(pa_volume_gt5mm_mm3),
+        #     "pv_volume_gt5mm_mm3": float(pv_volume_gt5mm_mm3),
+        #     "pa_volume_lt5mm_mm3": float(pa_volume_lt5mm_mm3),
+        #     "pv_volume_lt5mm_mm3": float(pv_volume_lt5mm_mm3),
+        # }
+
+
 if __name__ == "__main__":
     image_path = r"data\1.3.6.1.4.132274.66598776.77819905820063.1301827053.3.2_image.nii.gz"
     label_path = r"data\1.3.6.1.4.132274.66598776.77819905820063.1301827053.3.2_Sharkey_Segmentation.nii.gz"
